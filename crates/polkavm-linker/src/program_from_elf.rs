@@ -1206,13 +1206,13 @@ fn extract_exports(
                     Ok(add) => add,
                     Err(error) => return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error))),
                 };
-        
+
                 // TODO this patern 3* in a fn
                 let location = SectionTarget {
                     section_index: section.index(),
                     offset: b.offset() as u64,
                 };
-        
+
                 let target = if let Some(relocation) = relocations.get(&location) {
                     let RelocationKind::Abs {
                         target,
@@ -6481,6 +6481,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
