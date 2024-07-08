@@ -10,7 +10,7 @@ type ElfSymbol<'data, 'file> =
 type ElfSectionIndex = object::read::SectionIndex;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub struct SectionIndex(usize);
+pub struct SectionIndex(pub usize);
 
 impl SectionIndex {
     pub fn raw(self) -> usize {

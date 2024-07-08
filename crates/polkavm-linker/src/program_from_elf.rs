@@ -1136,6 +1136,25 @@ struct Export {
     metadata: ExternMetadata,
 }
 
+fn target_from_address(
+    elf: &Elf,
+    address: u32,
+) -> Option<SectionTarget> {
+    if address == 0 {
+        return None;
+    }
+    let address = address as u64;
+    for section in elf.sections() {
+        if address >= section.original_address() && address < section.original_address() + section.size() {
+            return Some(SectionTarget {
+                section_index: section.index(),
+                offset: address - section.original_address(),
+            })
+        }
+    }
+    None
+}
+
 fn extract_exports(
     elf: &Elf,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
@@ -1159,17 +1178,74 @@ fn extract_exports(
                 offset: b.offset() as u64,
             };
 
-            // Ignore the address as written; we'll just use the relocations instead.
-            if let Err(error) = b.read_u32() {
-                return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
-            }
-
-            let Some(relocation) = relocations.get(&location) else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an export without a relocation for a pointer to the metadata at {location}"
-                )));
+            let add = match b.read_u32() {
+                Ok(add) => add,
+                Err(error) => return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error))),
             };
 
+            let target = if let Some(relocation) = relocations.get(&location) {
+                if let RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } = relocation {
+                    *target
+                } else {
+                    target_from_address(elf, add).ok_or_else(|| ProgramFromElfError::other(format!(
+                        "found an export with an unexpected relocation at {location}: {relocation:?}"
+                    )))?
+                }
+            } else {
+                target_from_address(elf, add).ok_or_else(|| ProgramFromElfError::other(format!(
+                    "found an export without a relocation for a pointer to the metadata at {location}"
+                )))?
+            };
+            let mut m = parse_extern_metadata(elf, relocations,  target)?;
+            if m.symbol.iter().all(|i| *i == 0) {
+                // read symbol name ptr from export section
+                let add = match b.read_u32() {
+                    Ok(add) => add,
+                    Err(error) => return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error))),
+                };
+        
+                // TODO this patern 3* in a fn
+                let location = SectionTarget {
+                    section_index: section.index(),
+                    offset: b.offset() as u64,
+                };
+        
+                let target = if let Some(relocation) = relocations.get(&location) {
+                    let RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U32,
+                    } = relocation
+                    else {
+                        return Err(ProgramFromElfError::other(format!(
+                            "found an export with an unexpected relocation at {location}: {relocation:?}"
+                        )));
+                    };
+                    *target
+                } else {
+                    target_from_address(elf, add).ok_or_else(|| ProgramFromElfError::other(format!(
+                        "found an export without a relocation for a pointer to the code at {location}"
+                    )))?
+                };
+                let end = target.offset as usize + m.symbol.len();
+                m.symbol.copy_from_slice(&elf.section_by_index(target.section_index).data()[target.offset as usize ..end]);
+            }
+            m
+        };
+
+        let location = SectionTarget {
+            section_index: section.index(),
+            offset: b.offset() as u64,
+        };
+
+        let add = match b.read_u32() {
+            Ok(add) => add,
+            Err(error) => return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error))),
+        };
+
+        let target = if let Some(relocation) = relocations.get(&location) {
             let RelocationKind::Abs {
                 target,
                 size: RelocationSize::U32,
@@ -1179,38 +1255,15 @@ fn extract_exports(
                     "found an export with an unexpected relocation at {location}: {relocation:?}"
                 )));
             };
-
-            parse_extern_metadata(elf, relocations, *target)?
-        };
-
-        let location = SectionTarget {
-            section_index: section.index(),
-            offset: b.offset() as u64,
-        };
-
-        // Ignore the address as written; we'll just use the relocations instead.
-        if let Err(error) = b.read_u32() {
-            return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
-        }
-
-        let Some(relocation) = relocations.get(&location) else {
-            return Err(ProgramFromElfError::other(format!(
+            *target
+        } else {
+            target_from_address(elf, add).ok_or_else(|| ProgramFromElfError::other(format!(
                 "found an export without a relocation for a pointer to the code at {location}"
-            )));
-        };
-
-        let RelocationKind::Abs {
-            target,
-            size: RelocationSize::U32,
-        } = relocation
-        else {
-            return Err(ProgramFromElfError::other(format!(
-                "found an export with an unexpected relocation at {location}: {relocation:?}"
-            )));
+            )))?
         };
 
         exports.push(Export {
-            location: *target,
+            location: target,
             metadata,
         });
     }
@@ -1280,31 +1333,39 @@ fn parse_extern_metadata_impl(
 
     let flags = b.read_u32()?;
     let symbol_length = b.read_u32()?;
-    let Some(symbol_relocation) = relocations.get(&SectionTarget {
+    // Ignore the address as written; we'll just use the relocations instead.
+    let add = b.read_u32()?;
+
+    // TODO als this one is missing from reloc (as we write u32 and not symbol)
+    let symbol = if let Some(symbol_relocation) = relocations.get(&SectionTarget {
         section_index: section.index(),
         offset: b.offset() as u64,
-    }) else {
-        return Err("missing relocation for the symbol".into());
+    }) {
+        let RelocationKind::Abs {
+            target: symbol_location,
+            size: RelocationSize::U32,
+        } = symbol_relocation
+        else {
+            return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
+        };
+
+        let Some(symbol) = elf
+            .section_by_index(symbol_location.section_index)
+            .data()
+            .get(symbol_location.offset as usize..symbol_location.offset.saturating_add(u64::from(symbol_length)) as usize)
+        else {
+            return Err("symbol out of bounds".into());
+        };
+        symbol.to_owned()
+    } else {
+        if add == 0 {
+            // ignore symbol name, empty string indicate next export is containing ptr to it
+            vec![0;symbol_length as usize]
+        } else {
+            return Err("missing relocation for the symbol".into());
+        }
     };
 
-    // Ignore the address as written; we'll just use the relocations instead.
-    b.read_u32()?;
-
-    let RelocationKind::Abs {
-        target: symbol_location,
-        size: RelocationSize::U32,
-    } = symbol_relocation
-    else {
-        return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
-    };
-
-    let Some(symbol) = elf
-        .section_by_index(symbol_location.section_index)
-        .data()
-        .get(symbol_location.offset as usize..symbol_location.offset.saturating_add(u64::from(symbol_length)) as usize)
-    else {
-        return Err("symbol out of bounds".into());
-    };
 
     let input_regs = b.read_byte()?;
     if input_regs as usize > Reg::INPUT_REGS.len() {
@@ -1322,7 +1383,7 @@ fn parse_extern_metadata_impl(
 
     Ok(ExternMetadata {
         index: None,
-        symbol: symbol.to_owned(),
+        symbol,
         input_regs,
         output_regs,
     })
