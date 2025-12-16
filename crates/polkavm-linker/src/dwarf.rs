@@ -829,11 +829,19 @@ where
                 | LineInstruction::UnknownStandardN(..)
                 | LineInstruction::UnknownExtended(..) => {}
 
-                LineInstruction::AdvancePc(..) | LineInstruction::ConstAddPc => {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: unsupported line program instruction: {instruction:?}",
-                    ));
-                }
+                //LineInstruction::ConstAddPc => {
+                    // TODO why
+                    //return Err(ProgramFromElfError::other(
+                    //    "failed to process DWARF: unsupported line program instruction: ConstAddPc",
+                    //));
+                //}
+
+                // LineInstruction::AdvancePc(..) => {
+                    // TODO why
+                    //return Err(ProgramFromElfError::other(
+                    //    "failed to process DWARF: unsupported line program instruction: AdvancePc",
+                    //));
+                //}
 
                 LineInstruction::SetAddress(..) => {
                     let relocation_target = SectionTarget {
@@ -844,7 +852,7 @@ where
                     target = try_fetch_relocation(relocations, relocation_target, is_64bit)?;
                 }
 
-                LineInstruction::FixedAddPc(..) => {
+                LineInstruction::AdvancePc(..) | LineInstruction::ConstAddPc | LineInstruction::FixedAddPc(..) => {
                     let relocation_target = SectionTarget {
                         section_index,
                         offset: *tracker.list().last().unwrap(),
