@@ -1369,6 +1369,7 @@ struct Export {
 
 fn target_from_address(elf: &Elf, address: u64) -> Option<SectionTarget> {
     if address == 0 {
+        log::error!("getting address null");
         return None;
     }
     for section in elf.sections() {
@@ -1426,6 +1427,7 @@ fn extract_exports(
                     }
                 }
             } else {
+                log::error!("using direct address");
                 target_from_address(elf, address).ok_or_else(|| {
                     ProgramFromElfError::other(format!(
                         "found an export without a relocation for a pointer to the metadata at {location}"
@@ -1570,7 +1572,12 @@ fn parse_extern_metadata_impl(
         symbol.to_owned()
     } else {
         // metadata address written from zig
+        // TODO could just write directly symbol bytes instead of using a reloc here (likely would
+        // want to switch behavior on an enum (not linear version), eg version 3: full reloc or no
+        // reloc encoding (then can have better code here (no error fetching reloc for zig): TODO
+        // change code to use version 0 as noreloc for a start?
         if address == 0 {
+            log::error!("reading null meta address");
             // ignore symbol name, empty string indicate next export is containing ptr to it
             vec![0; symbol_length as usize]
         } else {
@@ -1588,6 +1595,7 @@ fn parse_extern_metadata_impl(
         return Err(format!("too many output registers: {output_regs}"));
     }
 
+    // TODO add index in zig (looks like dead code here: no macro building it ?)
     let index = if version >= 2 {
         let has_index = b.read_byte()?;
         let index = b.read_u32()?;
