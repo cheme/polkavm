@@ -1403,22 +1403,18 @@ fn extract_exports(
         let direct = version == 0;
 
         let metadata = {
-            let location = SectionTarget {
-                section_index: section.index(),
-                offset: b.offset() as u64,
-            };
-
             // Ignore the address as written; we'll just use the relocations instead.
             let address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
             let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
             let target = if direct {
-                target_from_address(elf, address).ok_or_else(|| {
-                    ProgramFromElfError::other(format!(
-                        "found an export without a relocation for a pointer to the metadata at {location}"
-                    ))
-                })?
+                target_from_address(elf, address).ok_or_else(|| ProgramFromElfError::other("Wrong address for target"))?
             } else {
+                let location = SectionTarget {
+                    section_index: section.index(),
+                    offset: b.offset() as u64,
+                };
+
                 let Some(relocation) = relocations.get(&location) else {
                     return Err(ProgramFromElfError::other(format!(
                         "found an export without a relocation for a pointer to the metadata at {location} (found address = 0x{address:x})"
@@ -1559,22 +1555,8 @@ fn parse_extern_metadata_impl(
     let flags = b.read_u32()?;
     let symbol_length = b.read_u32()?;
 
-    let address = if elf.is_64() { b.read_u64()? } else { b.read_u32()? as u64 };
-
     let symbol = if direct {
-        // metadata address written from zig
-        // TODO could just write directly symbol bytes instead of using a reloc here (likely would
-        // want to switch behavior on an enum (not linear version), eg version 3: full reloc or no
-        // reloc encoding (then can have better code here (no error fetching reloc for zig): TODO
-        // change code to use version 0 as noreloc for a start?
-        if address == 0 {
-            log::error!("reading null meta address");
-            // ignore symbol name, empty string indicate next export is containing ptr to it
-            vec![0; symbol_length as usize]
-        } else {
-            log::error!("reading non null meta address: {:?}", address);
-            return Err("missing relocation for the symbol".into());
-        }
+        b.read(symbol_length as usize)?.to_owned()
     } else {
         let Some(symbol_relocation) = relocations.get(&SectionTarget {
                 section_index: section.index(),
@@ -1602,8 +1584,18 @@ fn parse_extern_metadata_impl(
             else {
                 return Err("symbol out of bounds".into());
             };
+
+        // Ignore the address as written; we'll just use the relocations instead.
+        if elf.is_64() {
+            b.read_u64()?;
+        } else {
+            b.read_u32()?;
+        };
+
         symbol.to_owned()
     };
+
+    log::error!("read symbol {:?}", symbol);
 
     let input_regs = b.read_byte()?;
     if input_regs as usize > Reg::INPUT_REGS.len() {
