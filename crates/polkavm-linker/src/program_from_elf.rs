@@ -1403,6 +1403,11 @@ fn extract_exports(
         let direct = version == 0;
 
         let metadata = {
+            let location = SectionTarget {
+                section_index: section.index(),
+                offset: b.offset() as u64,
+            };
+
             // Ignore the address as written; we'll just use the relocations instead.
             let address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
             let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
@@ -1410,11 +1415,6 @@ fn extract_exports(
             let target = if direct {
                 target_from_address(elf, address).ok_or_else(|| ProgramFromElfError::other("Wrong address for target"))?
             } else {
-                let location = SectionTarget {
-                    section_index: section.index(),
-                    offset: b.offset() as u64,
-                };
-
                 let Some(relocation) = relocations.get(&location) else {
                     return Err(ProgramFromElfError::other(format!(
                         "found an export without a relocation for a pointer to the metadata at {location} (found address = 0x{address:x})"
@@ -1446,8 +1446,8 @@ fn extract_exports(
             offset: b.offset() as u64,
         };
 
-        let address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
-        let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
+        let result_address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
+        let address = result_address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
         let target = if direct {
             target_from_address(elf, address).ok_or_else(|| {
@@ -1554,36 +1554,15 @@ fn parse_extern_metadata_impl(
 
     let flags = b.read_u32()?;
     let symbol_length = b.read_u32()?;
-
     let symbol = if direct {
         b.read(symbol_length as usize)?.to_owned()
     } else {
         let Some(symbol_relocation) = relocations.get(&SectionTarget {
-                section_index: section.index(),
-                offset: b.offset() as u64,
-            }) else {
-                return Err("missing relocation for the symbol".into());
-            };
-
-        let symbol_location = match symbol_relocation {
-            RelocationKind::Abs {
-                target,
-                size: RelocationSize::U64,
-            } if elf.is_64() => *target,
-            RelocationKind::Abs {
-                target,
-                size: RelocationSize::U32,
-            } if !elf.is_64() => *target,
-            _ => return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}")),
+            section_index: section.index(),
+            offset: b.offset() as u64,
+        }) else {
+            return Err("missing relocation for the symbol".into());
         };
-
-        let Some(symbol) = elf
-            .section_by_index(symbol_location.section_index)
-            .data()
-            .get(symbol_location.offset as usize..symbol_location.offset.saturating_add(u64::from(symbol_length)) as usize)
-            else {
-                return Err("symbol out of bounds".into());
-            };
 
         // Ignore the address as written; we'll just use the relocations instead.
         if elf.is_64() {
@@ -1592,6 +1571,25 @@ fn parse_extern_metadata_impl(
             b.read_u32()?;
         };
 
+        let symbol_location = match symbol_relocation {
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U64,
+            } if elf.is_64() => target,
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U32,
+            } if !elf.is_64() => target,
+            _ => return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}")),
+        };
+
+        let Some(symbol) = elf
+            .section_by_index(symbol_location.section_index)
+            .data()
+            .get(symbol_location.offset as usize..symbol_location.offset.saturating_add(u64::from(symbol_length)) as usize)
+        else {
+            return Err("symbol out of bounds".into());
+        };
         symbol.to_owned()
     };
 
@@ -8966,12 +8964,6 @@ fn harvest_data_relocations(
     log::trace!("Harvesting data relocations from section: {}", section_name);
 
     let mut for_address = BTreeMap::new();
-    //log::error!(" section: {:?}", section.original_address());
-    //for (absolute_address, relocation) in section.relocations() {
-    //    if absolute_address.checked_sub(section.original_address()).is_none() {
-    //    log::error!("Harvesting data relocations from section: {:?} {:?}", absolute_address, relocation);
-    //    }
-    //}
     for (absolute_address, relocation) in section.relocations() {
         if (relocation.flags()
             == object::RelocationFlags::Elf {
@@ -10235,9 +10227,6 @@ fn program_from_elf_internal(config: Config, isa: TargetInstructionSet, mut elf:
         harvest_code_relocations(&elf, section, &decoder_config, &mut instruction_overrides, &mut relocations)?;
     }
 
-    if sections_exports.len() > 1 {
-        panic!("internal error: mult pexport");
-    }
     let exports = sections_exports
         .iter()
         .map(|&section_index| {
