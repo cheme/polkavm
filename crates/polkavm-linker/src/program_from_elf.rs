@@ -1380,6 +1380,7 @@ fn target_from_address(elf: &Elf, address: u64) -> Option<SectionTarget> {
             });
         }
     }
+    log::error!(" address not in section {:?}", address);
     None
 }
 
@@ -1387,6 +1388,27 @@ fn extract_exports(
     elf: &Elf,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     section: &Section,
+) -> Result<Vec<Export>, ProgramFromElfError> {
+    return extract_import_exports_impl(elf, relocations, section, false);
+}
+
+fn extract_imports(
+    elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    section: &Section,
+) -> Result<Vec<Import>, ProgramFromElfError> {
+    // Rather terrible memory copy.
+    return Ok(extract_import_exports_impl(elf, relocations, section, true)?
+        .into_iter()
+        .map(|export| Import { metadata: export.metadata})
+        .collect());
+}
+
+fn extract_import_exports_impl(
+    elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    section: &Section,
+    with_dummy_target: bool,
 ) -> Result<Vec<Export>, ProgramFromElfError> {
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let mut exports = Vec::new();
@@ -1408,7 +1430,6 @@ fn extract_exports(
                 offset: b.offset() as u64,
             };
 
-            // Ignore the address as written; we'll just use the relocations instead.
             let address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
             let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
@@ -1449,7 +1470,12 @@ fn extract_exports(
         let result_address = if elf.is_64() { b.read_u64() } else { b.read_u32().map(u64::from) };
         let address = result_address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
-        let target = if direct {
+        let target = if with_dummy_target {
+            SectionTarget {
+                section_index: section.index(),
+                offset: 0,
+            }
+        } else if direct {
             target_from_address(elf, address).ok_or_else(|| {
                 ProgramFromElfError::other(format!(
                     "found an export without a relocation for a pointer to the code at {location}"
@@ -1606,8 +1632,10 @@ fn parse_extern_metadata_impl(
     }
 
     // TODO add index in zig (looks like dead code here: no macro building it ?)
-    let index = if version >= 2 {
+    let index = if version == 0 || version >= 2 {
         let has_index = b.read_byte()?;
+
+                log::error!(" ti {:?}", &b.buffer[..4]);
         let index = b.read_u32()?;
         if has_index > 0 {
             Some(index)
@@ -2995,6 +3023,12 @@ fn parse_code_section(
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
     opt_level: OptLevel,
 ) -> Result<(), ProgramFromElfError> {
+    let nb_imports = elf.section_by_name(".polkavm_imports").len();
+    if nb_imports > 1 {
+        return Err(ProgramFromElfError::other("multiple polkavm imports sections"));
+    }
+    let direct = nb_imports > 0;
+
     let section_index = section.index();
     let section_name = section.name();
     let text = &section.data();
@@ -3027,41 +3061,85 @@ fn parse_code_section(
             let target_location = current_location.add(4);
             relative_offset += 4 + pointer_size;
 
-            let Some(relocation) = relocations.get(&target_location) else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an external call without a relocation for a pointer to metadata at {target_location}"
-                )));
-            };
+            let nth_import = if direct {
+                if imports.is_empty() {
+                    let import_section = elf.section_by_name(".polkavm_imports").next().unwrap();
 
-            let metadata_location = match relocation {
-                RelocationKind::Abs {
-                    target,
-                    size: RelocationSize::U64,
-                } if elf.is_64() => target,
-                RelocationKind::Abs {
-                    target,
-                    size: RelocationSize::U32,
-                } if !elf.is_64() => target,
-                _ => {
+                    *imports = extract_imports(elf, relocations, import_section)?;
+
+                    if imports.is_empty() {
+                        return Err(ProgramFromElfError::other("empty polkavm imports section"));
+                    }
+
+                    for (i, import) in imports.iter_mut().enumerate()  {
+                        log::error!(" put_ix {:?}", import.metadata.index.unwrap());
+                        let index_only_meta = ExternMetadata {
+                            index: Some(import.metadata.index.unwrap()), //TODO proper error
+                            symbol: vec![],
+                            input_regs: 0,
+                            output_regs: 0,
+                        };
+                        metadata_to_nth_import.insert(index_only_meta, i);
+                        import.metadata.index = None;
+                    }
+                    log::error!("m {:?}", imports.len());
+                }
+
+                let mut b = polkavm_common::elf::Reader::from(&text[relative_offset - 4..]);
+                log::error!(" t {:?}", &text[relative_offset - 4..relative_offset]);
+                let call_index = b.read_u32()
+                    .map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
+                let index_only_meta = ExternMetadata {
+                    index: Some(call_index),
+                    symbol: vec![],
+                    input_regs: 0,
+                    output_regs: 0,
+                };
+                log::error!(" call_ix {:?}", call_index);
+                // TODO proper error
+                let import_index = *metadata_to_nth_import.get(&index_only_meta).unwrap();
+                log::error!(" calling {:?}", import_index);
+                if import_index >= imports.len() {
+                    return Err(ProgramFromElfError::other("imports index out of range"));
+                }
+                import_index
+            } else {
+                let Some(relocation) = relocations.get(&target_location) else {
                     return Err(ProgramFromElfError::other(format!(
-                        "found an external call with an unexpected relocation at {target_location}: {relocation:?}"
+                        "found an external call without a relocation for a pointer to metadata at {target_location}"
                     )));
-                }
-            };
+                };
+                // getting import metadata from it being sym after ecalli
+                let metadata_location = match relocation {
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    } if elf.is_64() => target,
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U32,
+                    } if !elf.is_64() => target,
+                    _ => {
+                        return Err(ProgramFromElfError::other(format!(
+                            "found an external call with an unexpected relocation at {target_location}: {relocation:?}"
+                        )));
+                    }
+                };
 
-            let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
+                let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
 
-            // The same import can be inlined in multiple places, so deduplicate those here.
-            let nth_import = match metadata_to_nth_import.entry(metadata) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let nth_import = imports.len();
-                    imports.push(Import {
-                        metadata: entry.key().clone(),
-                    });
-                    entry.insert(nth_import);
-                    nth_import
+                // The same import can be inlined in multiple places, so deduplicate those here.
+                match metadata_to_nth_import.entry(metadata) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let nth_import = imports.len();
+                        imports.push(Import {
+                            metadata: entry.key().clone(),
+                        });
+                        entry.insert(nth_import);
+                        nth_import
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 }
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             };
 
             output.push((
