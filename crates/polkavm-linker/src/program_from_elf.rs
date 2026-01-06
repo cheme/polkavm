@@ -1400,7 +1400,7 @@ fn extract_imports(
     // Rather terrible memory copy.
     return Ok(extract_import_exports_impl(elf, relocations, section, true)?
         .into_iter()
-        .map(|export| Import { metadata: export.metadata})
+        .map(|export| Import { metadata: export.metadata })
         .collect());
 }
 
@@ -1434,6 +1434,7 @@ fn extract_import_exports_impl(
             let address = address.map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
 
             let target = if direct {
+                log::error!("meta add");
                 target_from_address(elf, address).ok_or_else(|| ProgramFromElfError::other("Wrong address for target"))?
             } else {
                 let Some(relocation) = relocations.get(&location) else {
@@ -1476,6 +1477,7 @@ fn extract_import_exports_impl(
                 offset: 0,
             }
         } else if direct {
+            log::error!("target add");
             target_from_address(elf, address).ok_or_else(|| {
                 ProgramFromElfError::other(format!(
                     "found an export without a relocation for a pointer to the code at {location}"
@@ -1635,7 +1637,7 @@ fn parse_extern_metadata_impl(
     let index = if version == 0 || version >= 2 {
         let has_index = b.read_byte()?;
 
-                log::error!(" ti {:?}", &b.buffer[..4]);
+        log::error!(" ti {:?}", &b.buffer[..4]);
         let index = b.read_u32()?;
         if has_index > 0 {
             Some(index)
@@ -3071,7 +3073,7 @@ fn parse_code_section(
                         return Err(ProgramFromElfError::other("empty polkavm imports section"));
                     }
 
-                    for (i, import) in imports.iter_mut().enumerate()  {
+                    for (i, import) in imports.iter_mut().enumerate() {
                         log::error!(" put_ix {:?}", import.metadata.index.unwrap());
                         let index_only_meta = ExternMetadata {
                             index: Some(import.metadata.index.unwrap()), //TODO proper error
@@ -3085,9 +3087,10 @@ fn parse_code_section(
                     log::error!("m {:?}", imports.len());
                 }
 
-                let mut b = polkavm_common::elf::Reader::from(&text[relative_offset - 4..]);
-                log::error!(" t {:?}", &text[relative_offset - 4..relative_offset]);
-                let call_index = b.read_u32()
+                let mut b = polkavm_common::elf::Reader::from(&text[relative_offset - pointer_size..]);
+                log::error!(" t {:?}", &text[relative_offset - pointer_size..relative_offset]);
+                let call_index = b
+                    .read_u32()
                     .map_err(|error| ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)))?;
                 let index_only_meta = ExternMetadata {
                     index: Some(call_index),
@@ -3243,7 +3246,61 @@ fn parse_code_section(
                     let next_inst = Inst::decode(decoder_config, next_inst);
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
-                        if base == ra_dst && base == base_upper {
+                        // in our case: value_upper 0, dst r1 -> value upper is 0 is same as putting pc in
+                        // base_upper
+                        //  18d2:       00000097                auipc   ra,0x0 -> save pc here in return address (pc + 0)
+                        //  18d6:       566080e7                jalr    1382(ra) # 1e38 <memcpy> -> call fn
+                        //  actually for risc32 also have :
+                        //
+                        // 1990:       00000317                auipc   t1,0x0
+                        // 1994:       1c430067                jr      452(t1) # 1b54 <Io.Writer.printIntAny__anon_4525>
+                        // with ra being always ra (reg t1 use for calc only).
+                        // with no ra or ra on t1??
+                        //  returning on this call (so likely a loop skipping save ra).
+                        //  at 18d2 + 1382 with return address in reg zero (so return to prev 18d2).
+                        if ra_dst == RReg::Zero && base == base_upper {
+                            if let Some(ra) = cast_reg_non_zero(base_upper)? {
+                                let offset = (relative_offset as i32 - inst_size as i32)
+                                    .wrapping_add(value)
+                                    .wrapping_add(value_upper as i32);
+                                if offset >= 0 && offset < section.data().len() as i32 {
+                                    log::error!(
+                                        "spcall, {:?} {} {} {} {} {}",
+                                        ra,
+                                        offset,
+                                        current_location,
+                                        relative_offset,
+                                        value_upper,
+                                        value
+                                    );
+                                    output.push((
+                                        source,
+                                        InstExt::Control(ControlInst::Call {
+                                            // TODO make little sense to have something else than
+                                            // Ra here??
+                                            //ra,
+                                            ra: Reg::RA,
+                                            target: SectionTarget {
+                                                section_index,
+                                                offset: u64::from(cast(offset).to_unsigned()),
+                                            },
+                                            target_return: current_location.add(inst_size + next_inst_size),
+                                            // TODO next code is not intent: intent of
+                                            // target_return is a falltrough, ra is use for jumping
+                                            // back.
+                                            //target_return: if base_upper == RReg::RA {
+                                            //    current_location
+                                            //} else {
+                                            //    unimplemented!("resolve previous ra value")
+                                            //},
+                                        }),
+                                    ));
+                                    relative_offset += next_inst_size as usize;
+                                    //                                     spcall, T1 1680 <section #9+1228> 1236
+                                    continue;
+                                }
+                            }
+                        } else if base == ra_dst && base == base_upper {
                             if let Some(ra) = cast_reg_non_zero(ra_dst)? {
                                 let offset = (relative_offset as i32 - next_inst_size as i32)
                                     .wrapping_add(value)
@@ -3260,12 +3317,14 @@ fn parse_code_section(
                                             target_return: current_location.add(inst_size + next_inst_size),
                                         }),
                                     ));
-
                                     relative_offset += next_inst_size as usize;
                                     continue;
                                 }
                             }
+                        } else {
+                            log::error!("out spe aui txt3, {} {} {} {} {}", base, ra_dst, base_upper, value, value_upper);
                         }
+
                     // This can happen when a function grabs its own address (to e.g. seed an RNG).
                     } else if let Some(Inst::RegImm {
                         kind,
@@ -3337,8 +3396,14 @@ fn parse_code_section(
 
                             relative_offset += next_inst_size as usize;
                             continue;
+                        } else {
+                            log::error!("out spe aui txt2");
                         }
+                    } else {
+                        log::error!("out spe aui unexpected");
                     }
+                } else {
+                    log::error!("out spe aui txt");
                 }
             }
 
@@ -3414,10 +3479,23 @@ fn split_code_into_basic_blocks(
             assert!((source.offset_range.start..source.offset_range.end)
                 .step_by(2)
                 .skip(1)
-                .all(|offset| !jump_targets.contains(&SectionTarget {
-                    section_index: source.section_index,
-                    offset
-                })));
+                .all(|offset| {
+                    if jump_targets.contains(&SectionTarget {
+                        section_index: source.section_index,
+                        offset,
+                    }) {
+                        log::error!(
+                            "jump target in block at offset {}, section {}, start: {} end {}",
+                            offset,
+                            source.section_index,
+                            source.offset_range.start,
+                            source.offset_range.end
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }));
 
             if let Some((block_section, block_start)) = block_start_opt {
                 // We're in a block that's reachable by a jump.
