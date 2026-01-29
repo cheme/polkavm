@@ -2040,13 +2040,14 @@ fn convert_instruction(
             emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: value as i32 }));
             Ok(())
         }
-        Inst::JumpAndLink { dst, target } => {
+        Inst::JumpAndLink { dst, target: target2 } => {
             let target = SectionTarget {
                 section_index: section.index(),
-                offset: current_location.offset.wrapping_add_signed(i64::from(target as i32)),
+                offset: current_location.offset.wrapping_add_signed(i64::from(target2 as i32)),
             };
 
             if target.offset > section.size() {
+                log::error!("out of range JAL instruction, form {} off {} res {} max {}", current_location.offset, target2, target.offset, section.size());
                 return Err(ProgramFromElfError::other("out of range JAL instruction"));
             }
 

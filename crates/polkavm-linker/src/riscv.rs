@@ -652,12 +652,15 @@ impl Inst {
 
             // RVC, Quadrant 0
             // C.ADDI4SPN expands to addi rd′, x2, nzuimm[9:2]
-            (0b00, 0b000) if op & 0b00011111_11100000 != 0 => Some(Inst::RegImm {
+            (0b00, 0b000) if op & 0b00011111_11100000 != 0 => {
+                log::error!("addi4spn {}", op);
+                Some(Inst::RegImm {
                 kind: xlen!(RegImmKind, Add32, Add64),
                 dst: Reg::decode_compressed(op >> 2),
                 src: Reg::SP,
                 imm: (bits(4, 5, op, 11) | bits(6, 9, op, 7) | bits(2, 2, op, 6) | bits(3, 3, op, 5)) as i32,
-            }),
+            })
+            },
             // C.LW expands to lw rd′, offset[6:2](rs1′)
             (0b00, 0b010) => Some(Inst::Load {
                 kind: LoadKind::I32,
@@ -710,10 +713,13 @@ impl Inst {
                 })
             }
             // C.JAL expands to jal x1, offset[11:1]
-            (0b01, 0b001) if !config.rv64 => Some(Inst::JumpAndLink {
-                dst: Reg::RA,
+            (0b01, 0b001) if !config.rv64 => {
+                log::error!("jal2 {}", bits_imm_c_jump(op));
+                Some(Inst::JumpAndLink {
+                dst: Reg::RA, // not necessarily...
                 target: bits_imm_c_jump(op),
-            }),
+            })
+            },
             // C.ADDIW extends to addiw rd, rd, imm[5:0]
             (0b01, 0b001) => {
                 let imm = bits(5, 5, op, 12) | bits(0, 4, op, 2);
@@ -809,10 +815,12 @@ impl Inst {
                 }
             }
             // C.J expands to jal x0, offset[11:1]
-            (0b01, 0b101) => Some(Inst::JumpAndLink {
+            (0b01, 0b101) => {
+                log::error!("j {} {} op {}", bits_imm_c_jump(op), bits_imm_c_jump(op) as i32, op);
+                Some(Inst::JumpAndLink {
                 dst: Reg::Zero,
                 target: bits_imm_c_jump(op),
-            }),
+            })},
             // C.BEQZ expands to beq rs1′, x0, offset[8:1]
             // C.BNEZ expands to bne rs1′, x0, offset[8:1]
             (0b01, funct3 @ 0b110) | (0b01, funct3 @ 0b111) => Some(Inst::Branch {
@@ -947,6 +955,10 @@ impl Inst {
                 })
             }
             0b1101111 => {
+                log::error!("jal  {} op {}", sign_ext(
+                        bits(1, 10, op, 21) | bits(11, 11, op, 20) | bits(12, 19, op, 12) | bits(20, 20, op, 31),
+                        21,
+                    ) as u32, op);
                 // JAL
                 Some(Inst::JumpAndLink {
                     dst: Reg::decode(op >> 7),
