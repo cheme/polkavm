@@ -3247,18 +3247,8 @@ fn parse_code_section(
                     let next_inst = Inst::decode(decoder_config, next_inst);
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
-                        // in our case: value_upper 0, dst r1 -> value upper is 0 is same as putting pc in
-                        // base_upper
-                        //  18d2:       00000097                auipc   ra,0x0 -> save pc here in return address (pc + 0)
-                        //  18d6:       566080e7                jalr    1382(ra) # 1e38 <memcpy> -> call fn
-                        //  actually for risc32 also have :
-                        //
                         // 1990:       00000317                auipc   t1,0x0
                         // 1994:       1c430067                jr      452(t1) # 1b54 <Io.Writer.printIntAny__anon_4525>
-                        // with ra being always ra (reg t1 use for calc only).
-                        // with no ra or ra on t1??
-                        //  returning on this call (so likely a loop skipping save ra).
-                        //  at 18d2 + 1382 with return address in reg zero (so return to prev 18d2).
                         if ra_dst == RReg::Zero && base == base_upper {
                             if let Some(ra) = cast_reg_non_zero(base_upper)? {
                                 let offset = (relative_offset as i32 - inst_size as i32)
@@ -3277,9 +3267,8 @@ fn parse_code_section(
                                     output.push((
                                         source,
                                         InstExt::Control(ControlInst::Call {
-                                            // TODO make little sense to have something else than
-                                            // Ra here??
-                                            //ra,
+                                            // TODO this can actually be another one (would need to
+                                            // lookup jump destination)
                                             ra: Reg::RA,
                                             target: SectionTarget {
                                                 section_index,

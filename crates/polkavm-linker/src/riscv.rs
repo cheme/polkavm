@@ -716,7 +716,7 @@ impl Inst {
             (0b01, 0b001) if !config.rv64 => {
                 log::error!("jal2 {}", bits_imm_c_jump(op));
                 Some(Inst::JumpAndLink {
-                dst: Reg::RA, // not necessarily...
+                dst: Reg::RA,
                 target: bits_imm_c_jump(op),
             })
             },
