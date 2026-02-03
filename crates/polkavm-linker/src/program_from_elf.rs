@@ -3256,7 +3256,7 @@ fn parse_code_section(
                                     .wrapping_add(value_upper as i32);
                                 if offset >= 0 && offset < section.data().len() as i32 {
                                     log::error!(
-                                        "spcall, {:?} {} {} {} {} {}",
+                                        "spcall Incorrect, {:?} {} {} {} {} {}",
                                         ra,
                                         offset,
                                         current_location,
@@ -3267,9 +3267,11 @@ fn parse_code_section(
                                     output.push((
                                         source,
                                         InstExt::Control(ControlInst::Call {
-                                            // TODO this can actually be another one (would need to
-                                            // lookup jump destination)
-                                            ra: Reg::RA,
+                                            // TODO largely incorrect value: will be set at jr pc
+                                            // instead of uipc, yet likely unused
+                                            // TODO add a field here with additional offset and
+                                            // decode to target_return - inst_size - next_inst_size
+                                            ra: cast_reg_non_zero(base)?.unwrap(),
                                             target: SectionTarget {
                                                 section_index,
                                                 offset: u64::from(cast(offset).to_unsigned()),
