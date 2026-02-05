@@ -2958,6 +2958,7 @@ fn parse_code_section(
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
     opt_level: OptLevel,
+    exports: Option<&[Export]>,
 ) -> Result<(), ProgramFromElfError> {
     let section_name = section.name();
     let text = &section.data();
@@ -2970,32 +2971,72 @@ fn parse_code_section(
 
     output.reserve(text.len() / 4);
 
-    //    let exports = extract_exports(elf, relocations, section)?;
-    //
-    //    for export in exports {
-    //        let current_location = export.location;
-    //        let mut relative_offset: usize = current_location.offset.try_into().expect("overflow");
-    //    }
-    let mut relative_offset = 0;
-    while relative_offset < text.len() {
-        let current_location = SectionTarget {
-            section_index: section.index(),
-            offset: relative_offset.try_into().expect("overflow"),
-        };
-        parse_code_instruction(
-            elf,
-            section,
-            decoder_config,
-            text,
-            current_location,
-            &mut relative_offset,
-						relocations,
-            imports,
-            metadata_to_nth_import,
-            instruction_overrides,
-            output,
-            opt_level,
-        )?;
+    // TODO skip these exports when if not runing lazy in program_from_elf
+    if let Some(exports) = exports  {
+
+        let mut parsed_locations: BTreeSet<SectionTarget> = Default::default();
+        let mut target_queue: VecDeque<SectionTarget> = Default::default();
+        for export in exports {
+            target_queue.push_back(export.location);
+        }
+
+        while let Some(current_location) = target_queue.pop_front() {
+            if parsed_locations.contains(&current_location) {
+                continue;
+            }
+            parsed_locations.insert(current_location);
+
+            let mut relative_offset: usize = current_location.offset.try_into().expect("overflow");
+            if let Some(next) = parse_code_instruction(
+                elf,
+                section,
+                decoder_config,
+                text,
+                current_location,
+                &mut relative_offset,
+                relocations,
+                imports,
+                metadata_to_nth_import,
+                instruction_overrides, // TODO check if could this could need ordering
+                output,
+                opt_level,
+            )? {
+                match next {
+                    ControlInst::Jump { target, .. } => target_queue.push_back(target),
+                    ControlInst::Call { target, .. } => target_queue.push_back(target),
+                    ControlInst::Branch {
+                        target_true, target_false, ..
+                    } => {
+                        target_queue.push_back(target_true);
+                        target_queue.push_back(target_false);
+                    }
+                    ControlInst::Unimplemented => {}
+                    ControlInst::JumpIndirect { .. } | ControlInst::CallIndirect { .. } => unimplemented!("TODO how to handle these"),
+                }
+            }
+        }
+    } else {
+        let mut relative_offset = 0;
+        while relative_offset < text.len() {
+            let current_location = SectionTarget {
+                section_index: section.index(),
+                offset: relative_offset.try_into().expect("overflow"),
+            };
+            let _ = parse_code_instruction(
+                elf,
+                section,
+                decoder_config,
+                text,
+                current_location,
+                &mut relative_offset,
+                relocations,
+                imports,
+                metadata_to_nth_import,
+                instruction_overrides,
+                output,
+                opt_level,
+            )?;
+        }
     }
 
     Ok(())
@@ -3004,7 +3045,7 @@ fn parse_code_section(
 #[allow(clippy::too_many_arguments)]
 fn parse_code_instruction(
     elf: &Elf,
-    section: &Section, // TODO is it use for something else than index (els epass index)
+    section: &Section,
     decoder_config: &DecoderConfig,
     text: &[u8],
     current_location: SectionTarget,
@@ -3015,7 +3056,7 @@ fn parse_code_instruction(
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
     opt_level: OptLevel,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<Option<ControlInst<SectionTarget>>, ProgramFromElfError> {
     let section_index = section.index();
     let section_name = section.name();
     let (inst_size, raw_inst) = read_instruction_bytes(text, *relative_offset);
@@ -3077,7 +3118,7 @@ fn parse_code_instruction(
             InstExt::Basic(BasicInst::Ecalli { nth_import }),
         ));
 
-        return Ok(());
+        return Ok(None);
     }
 
     if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_SBRK, 0, dst, size, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
@@ -3102,7 +3143,7 @@ fn parse_code_instruction(
         ));
 
         *relative_offset += inst_size as usize;
-        return Ok(());
+        return Ok(None);
     }
 
     if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_MEMSET, 0, RReg::Zero, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
@@ -3115,7 +3156,7 @@ fn parse_code_instruction(
         ));
 
         *relative_offset += inst_size as usize;
-        return Ok(());
+        return Ok(None);
     }
 
     if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_HEAP_BASE, 0, dst, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
@@ -3131,7 +3172,7 @@ fn parse_code_instruction(
         ));
 
         *relative_offset += inst_size as usize;
-        return Ok(());
+        return Ok(None);
     }
 
     let source = Source {
@@ -3194,7 +3235,7 @@ fn parse_code_instruction(
 
                                 output.push((source, InstExt::Control(inst)));
                                 *relative_offset += next_inst_size as usize;
-                                return Ok(());
+                                return Ok(Some(inst));
                             }
                         }
                     }
@@ -3267,7 +3308,7 @@ fn parse_code_instruction(
                         }
 
                         *relative_offset += next_inst_size as usize;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -3275,11 +3316,11 @@ fn parse_code_instruction(
 
         if matches!(opt_level, OptLevel::Oexperimental) {
             if try_parse_prologue(decoder_config, elf, original_inst, relative_offset, source, text, output)? {
-                return Ok(());
+                return Ok(None);
             }
 
             if try_parse_epilogue(decoder_config, elf, original_inst, relative_offset, source, text, output)? {
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -3295,7 +3336,7 @@ fn parse_code_instruction(
             "internal error: no instructions were emitted for instruction {original_inst:?} in section {section_name}"
         );
     }
-    Ok(())
+    Ok(None)
 }
 
 fn split_code_into_basic_blocks(
@@ -10245,6 +10286,7 @@ fn program_from_elf_internal(config: Config, isa: TargetInstructionSet, mut elf:
             &mut instruction_overrides,
             &mut instructions,
             config.opt_level,
+            exports.is_empty().then(|| &exports[..]),
         )?;
 
         if instructions.len() > initial_instruction_count {
