@@ -829,19 +829,24 @@ where
                 | LineInstruction::UnknownStandardN(..)
                 | LineInstruction::UnknownExtended(..) => {}
 
-                //LineInstruction::ConstAddPc => {
-                    // TODO why
-                    //return Err(ProgramFromElfError::other(
-                    //    "failed to process DWARF: unsupported line program instruction: ConstAddPc",
-                    //));
-                //}
+                LineInstruction::AdvancePc(..) | LineInstruction::ConstAddPc => {
+                    let relocation_target = SectionTarget {
+                        section_index,
+                        offset: *tracker.list().last().unwrap(),
+                    };
 
-                // LineInstruction::AdvancePc(..) => {
-                    // TODO why
-                    //return Err(ProgramFromElfError::other(
-                    //    "failed to process DWARF: unsupported line program instruction: AdvancePc",
-                    //));
-                //}
+                    if let Ok(None) = try_fetch_size_relocation(relocations, relocation_target, is_64bit) {
+                        target = None;
+                    } else {
+                        // TODO: Some toolchains emit a size-style relocation (pair/origin..target),
+                        // while others may emit a direct absolute relocation. Try the size
+                        // relocation first (as used for `FixedAddPc`) and fall back to the
+                        // simple address relocation if no size relocation is present.
+                        return Err(ProgramFromElfError::other(
+                            "Unhandled relocation target for line program instruction: {instruction:?}",
+                        ));
+                    }
+                }
 
                 LineInstruction::SetAddress(..) => {
                     let relocation_target = SectionTarget {

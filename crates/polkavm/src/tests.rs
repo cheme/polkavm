@@ -4180,6 +4180,26 @@ fn test_basic_debug_info_64() {
 }
 
 #[test]
+fn test_advance_pc_and_const_add_pc_debug_info_64() {
+    // This ELF file was generated from Revive's unit test tests::unit::messages::transfer_suppressed
+    // To generate it again, either update Revive's source code to dump ELF file after linking and
+    // run `cargo t -p resolc -- --test 'tests::unit::messages::transfer_suppressed' --exact`
+    // or extract the solidity file from Revive's repo and run `resolc --solc solc test --debug-output-dir /tmp/test`
+    let elf = decompress_zstd(include_bytes!("../../../test-data/revive-transfer-example.zst"));
+
+    let mut config = polkavm_linker::Config::default();
+    config.set_optimize(true);
+    config.set_strip(false);
+
+    // Since the ELF file has been generated from Revive, use ReviveV1 instruction set to test it.
+    let bytes = polkavm_linker::program_from_elf(config, TargetInstructionSet::ReviveV1, elf.as_slice());
+    assert!(bytes.is_ok());
+    let program = ProgramBlob::parse(bytes.unwrap().into()).unwrap();
+    assert!(program.code().len() as u32 > 0);
+    // TODO: Check lines in debug info to make sure advance_pc and const_add_pc work properly
+}
+
+#[test]
 fn blob_len_works() {
     const EXAMPLE_BLOB: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
     assert_eq!(Some(EXAMPLE_BLOB.len() as BlobLen), ProgramBlob::blob_length(EXAMPLE_BLOB));
