@@ -2959,7 +2959,6 @@ fn parse_code_section(
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
     opt_level: OptLevel,
 ) -> Result<(), ProgramFromElfError> {
-    let section_index = section.index();
     let section_name = section.name();
     let text = &section.data();
 
@@ -2970,137 +2969,179 @@ fn parse_code_section(
     }
 
     output.reserve(text.len() / 4);
+
+    //    let exports = extract_exports(elf, relocations, section)?;
+    //
+    //    for export in exports {
+    //        let current_location = export.location;
+    //        let mut relative_offset: usize = current_location.offset.try_into().expect("overflow");
+    //    }
     let mut relative_offset = 0;
     while relative_offset < text.len() {
         let current_location = SectionTarget {
             section_index: section.index(),
             offset: relative_offset.try_into().expect("overflow"),
         };
+        parse_code_instruction(
+            elf,
+            section,
+            decoder_config,
+            text,
+            current_location,
+            &mut relative_offset,
+						relocations,
+            imports,
+            metadata_to_nth_import,
+            instruction_overrides,
+            output,
+            opt_level,
+        )?;
+    }
 
-        let (inst_size, raw_inst) = read_instruction_bytes(text, relative_offset);
+    Ok(())
+}
 
-        if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
-            let initial_offset = relative_offset as u64;
-            let pointer_size = if elf.is_64() { 8 } else { 4 };
+#[allow(clippy::too_many_arguments)]
+fn parse_code_instruction(
+    elf: &Elf,
+    section: &Section, // TODO is it use for something else than index (els epass index)
+    decoder_config: &DecoderConfig,
+    text: &[u8],
+    current_location: SectionTarget,
+    relative_offset: &mut usize, // TODO redundant with current location
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    imports: &mut Vec<Import>,
+    metadata_to_nth_import: &mut HashMap<ExternMetadata, usize>,
+    instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
+    output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
+    opt_level: OptLevel,
+) -> Result<(), ProgramFromElfError> {
+    let section_index = section.index();
+    let section_name = section.name();
+    let (inst_size, raw_inst) = read_instruction_bytes(text, *relative_offset);
 
-            // so (on 32-bit): 4 (ecalli) + 4 (pointer) = 8
-            if relative_offset + pointer_size + 4 > text.len() {
-                return Err(ProgramFromElfError::other("truncated ecalli instruction"));
-            }
+    if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
+        let initial_offset = *relative_offset as u64;
+        let pointer_size = if elf.is_64() { 8 } else { 4 };
 
-            let target_location = current_location.add(4);
-            relative_offset += 4 + pointer_size;
+        // so (on 32-bit): 4 (ecalli) + 4 (pointer) = 8
+        if *relative_offset + pointer_size + 4 > text.len() {
+            return Err(ProgramFromElfError::other("truncated ecalli instruction"));
+        }
 
-            let Some(relocation) = relocations.get(&target_location) else {
+        let target_location = current_location.add(4);
+        *relative_offset += 4 + pointer_size;
+
+        let Some(relocation) = relocations.get(&target_location) else {
                 return Err(ProgramFromElfError::other(format!(
                     "found an external call without a relocation for a pointer to metadata at {target_location}"
                 )));
             };
 
-            let metadata_location = match relocation {
-                RelocationKind::Abs {
-                    target,
-                    size: RelocationSize::U64,
-                } if elf.is_64() => target,
-                RelocationKind::Abs {
-                    target,
-                    size: RelocationSize::U32,
-                } if !elf.is_64() => target,
-                _ => {
-                    return Err(ProgramFromElfError::other(format!(
-                        "found an external call with an unexpected relocation at {target_location}: {relocation:?}"
-                    )));
-                }
-            };
+        let metadata_location = match relocation {
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U64,
+            } if elf.is_64() => target,
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U32,
+            } if !elf.is_64() => target,
+            _ => {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an external call with an unexpected relocation at {target_location}: {relocation:?}"
+                )));
+            }
+        };
 
-            let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
+        let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
 
-            // The same import can be inlined in multiple places, so deduplicate those here.
-            let nth_import = match metadata_to_nth_import.entry(metadata) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let nth_import = imports.len();
-                    imports.push(Import {
-                        metadata: entry.key().clone(),
-                    });
-                    entry.insert(nth_import);
-                    nth_import
-                }
-                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            };
+        // The same import can be inlined in multiple places, so deduplicate those here.
+        let nth_import = match metadata_to_nth_import.entry(metadata) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let nth_import = imports.len();
+                imports.push(Import {
+                    metadata: entry.key().clone(),
+                });
+                entry.insert(nth_import);
+                nth_import
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+        };
 
-            output.push((
-                Source {
-                    section_index,
-                    offset_range: AddressRange::from(initial_offset..relative_offset as u64),
-                },
-                InstExt::Basic(BasicInst::Ecalli { nth_import }),
-            ));
+        output.push((
+            Source {
+                section_index,
+                offset_range: AddressRange::from(initial_offset..*relative_offset as u64),
+            },
+            InstExt::Basic(BasicInst::Ecalli { nth_import }),
+        ));
 
-            continue;
-        }
+        return Ok(());
+    }
 
-        if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_SBRK, 0, dst, size, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
-            let Some(dst) = cast_reg_non_zero(dst)? else {
+    if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_SBRK, 0, dst, size, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
+        let Some(dst) = cast_reg_non_zero(dst)? else {
                 return Err(ProgramFromElfError::other(
                     "found an 'sbrk' instruction with the zero register as the destination",
                 ));
             };
 
-            let Some(size) = cast_reg_non_zero(size)? else {
+        let Some(size) = cast_reg_non_zero(size)? else {
                 return Err(ProgramFromElfError::other(
                     "found an 'sbrk' instruction with the zero register as the size",
                 ));
             };
 
-            output.push((
-                Source {
-                    section_index,
-                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
-                },
-                InstExt::Basic(BasicInst::Sbrk { dst, size }),
-            ));
+        output.push((
+            Source {
+                section_index,
+                offset_range: (*relative_offset as u64..*relative_offset as u64 + inst_size).into(),
+            },
+            InstExt::Basic(BasicInst::Sbrk { dst, size }),
+        ));
 
-            relative_offset += inst_size as usize;
-            continue;
-        }
+        *relative_offset += inst_size as usize;
+        return Ok(());
+    }
 
-        if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_MEMSET, 0, RReg::Zero, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
-            output.push((
-                Source {
-                    section_index,
-                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
-                },
-                InstExt::Basic(BasicInst::Memset),
-            ));
+    if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_MEMSET, 0, RReg::Zero, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
+        output.push((
+            Source {
+                section_index,
+                offset_range: (*relative_offset as u64..*relative_offset as u64 + inst_size).into(),
+            },
+            InstExt::Basic(BasicInst::Memset),
+        ));
 
-            relative_offset += inst_size as usize;
-            continue;
-        }
+        *relative_offset += inst_size as usize;
+        return Ok(());
+    }
 
-        if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_HEAP_BASE, 0, dst, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
-            output.push((
-                Source {
-                    section_index,
-                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
-                },
-                match cast_reg_non_zero(dst)? {
-                    Some(dst) => InstExt::Basic(BasicInst::LoadHeapBase { dst }),
-                    None => InstExt::Basic(BasicInst::Nop),
-                },
-            ));
+    if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_HEAP_BASE, 0, dst, RReg::Zero, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
+        output.push((
+            Source {
+                section_index,
+                offset_range: (*relative_offset as u64..*relative_offset as u64 + inst_size).into(),
+            },
+            match cast_reg_non_zero(dst)? {
+                Some(dst) => InstExt::Basic(BasicInst::LoadHeapBase { dst }),
+                None => InstExt::Basic(BasicInst::Nop),
+            },
+        ));
 
-            relative_offset += inst_size as usize;
-            continue;
-        }
+        *relative_offset += inst_size as usize;
+        return Ok(());
+    }
 
-        let source = Source {
-            section_index,
-            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + inst_size),
-        };
+    let source = Source {
+        section_index,
+        offset_range: AddressRange::from(*relative_offset as u64..*relative_offset as u64 + inst_size),
+    };
 
-        relative_offset += inst_size as usize;
+    *relative_offset += inst_size as usize;
 
-        let Some(original_inst) = Inst::decode(decoder_config, raw_inst) else {
+    let Some(original_inst) = Inst::decode(decoder_config, raw_inst) else {
             return Err(ProgramFromElfErrorKind::Other(
                 format!(
                     "unsupported instruction in {} ('{}') at address 0x{:x}: 0x{:08x}",
@@ -3114,66 +3155,65 @@ fn parse_code_section(
             .into());
         };
 
-        if let Some(inst) = instruction_overrides.remove(&current_location) {
-            output.push((source, inst));
-        } else {
-            // For some reason (compiler bug?) *very rarely* we have those AUIPC instructions
-            // without any relocation attached to them, so let's deal with them traditionally.
-            if let Inst::AddUpperImmediateToPc {
-                dst: base_upper,
-                value: value_upper,
-            } = original_inst
-            {
-                if relative_offset < text.len() {
-                    let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
-                    let next_inst = Inst::decode(decoder_config, next_inst);
+    if let Some(inst) = instruction_overrides.remove(&current_location) {
+        output.push((source, inst));
+    } else {
+        // For some reason (compiler bug?) *very rarely* we have those AUIPC instructions
+        // without any relocation attached to them, so let's deal with them traditionally.
+        if let Inst::AddUpperImmediateToPc {
+            dst: base_upper,
+            value: value_upper,
+        } = original_inst
+        {
+            if *relative_offset < text.len() {
+                let (next_inst_size, next_inst) = read_instruction_bytes(text, *relative_offset);
+                let next_inst = Inst::decode(decoder_config, next_inst);
 
-                    if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
-                        if base == ra_dst && base == base_upper {
-                            if let Some(ra) = cast_reg_non_zero(ra_dst)? {
-                                let offset = (relative_offset as i32 - next_inst_size as i32)
-                                    .wrapping_add(value)
-                                    .wrapping_add(value_upper as i32);
-                                if offset >= 0 && offset < section.data().len() as i32 {
-                                    let target = SectionTarget {
-                                        section_index,
-                                        offset: u64::from(cast(offset).to_unsigned()),
-                                    };
+                if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
+                    if base == ra_dst && base == base_upper {
+                        if let Some(ra) = cast_reg_non_zero(ra_dst)? {
+                            let offset = (*relative_offset as i32 - next_inst_size as i32)
+                                .wrapping_add(value)
+                                .wrapping_add(value_upper as i32);
+                            if offset >= 0 && offset < section.data().len() as i32 {
+                                let target = SectionTarget {
+                                    section_index,
+                                    offset: u64::from(cast(offset).to_unsigned()),
+                                };
 
-                                    let inst = if target == current_location {
-                                        // Infinite loop, in which case the return location might not be valid.
-                                        ControlInst::Jump { target }
-                                    } else {
-                                        ControlInst::Call {
-                                            ra,
-                                            target,
-                                            target_return: current_location.add(inst_size + next_inst_size),
-                                        }
-                                    };
+                                let inst = if target == current_location {
+                                    // Infinite loop, in which case the return location might not be valid.
+                                    ControlInst::Jump { target }
+                                } else {
+                                    ControlInst::Call {
+                                        ra,
+                                        target,
+                                        target_return: current_location.add(inst_size + next_inst_size),
+                                    }
+                                };
 
-                                    output.push((source, InstExt::Control(inst)));
-                                    relative_offset += next_inst_size as usize;
-                                    continue;
-                                }
+                                output.push((source, InstExt::Control(inst)));
+                                *relative_offset += next_inst_size as usize;
+                                return Ok(());
                             }
                         }
-                    // This can happen when a function grabs its own address (to e.g. seed an RNG).
-                    } else if let Some(Inst::RegImm {
-                        kind,
-                        dst: add_dst,
-                        src: add_src,
-                        imm: value_lower,
-                    }) = next_inst
+                    }
+                // This can happen when a function grabs its own address (to e.g. seed an RNG).
+                } else if let Some(Inst::RegImm {
+                    kind,
+                    dst: add_dst,
+                    src: add_src,
+                    imm: value_lower,
+                }) = next_inst
+                {
+                    if base_upper == add_src && ((elf.is_64() && kind == RegImmKind::Add64) || (!elf.is_64() && kind == RegImmKind::Add32))
                     {
-                        if base_upper == add_src
-                            && ((elf.is_64() && kind == RegImmKind::Add64) || (!elf.is_64() && kind == RegImmKind::Add32))
-                        {
-                            let offset = value_upper.wrapping_add(cast(value_lower).to_unsigned());
-                            let offset = cast(offset).to_signed();
-                            let offset = cast(offset).to_i64_sign_extend();
-                            let offset = current_location.offset.wrapping_add_signed(offset);
-                            if offset >= section.size() {
-                                return Err(ProgramFromElfError::other(format!(
+                        let offset = value_upper.wrapping_add(cast(value_lower).to_unsigned());
+                        let offset = cast(offset).to_signed();
+                        let offset = cast(offset).to_i64_sign_extend();
+                        let offset = current_location.offset.wrapping_add_signed(offset);
+                        if offset >= section.size() {
+                            return Err(ProgramFromElfError::other(format!(
                                     "found an unrelocated auipc instruction in {} ('{}') at address 0x{:x} with an oversized offset (offset = {}, section size = {})",
                                     current_location,
                                     section.name(),
@@ -3181,24 +3221,24 @@ fn parse_code_section(
                                     offset,
                                     section.size(),
                                 )));
-                            }
+                        }
 
-                            if let Some(dst) = cast_reg_non_zero(add_dst)? {
-                                output.push((
-                                    source,
-                                    InstExt::Basic(BasicInst::LoadAddress {
-                                        dst,
-                                        target: SectionTarget {
-                                            section_index: section.index(),
-                                            offset,
-                                        },
-                                    }),
-                                ));
-                            }
+                        if let Some(dst) = cast_reg_non_zero(add_dst)? {
+                            output.push((
+                                source,
+                                InstExt::Basic(BasicInst::LoadAddress {
+                                    dst,
+                                    target: SectionTarget {
+                                        section_index: section.index(),
+                                        offset,
+                                    },
+                                }),
+                            ));
+                        }
 
-                            if base_upper != add_dst {
-                                if let Some(base_upper) = cast_reg_non_zero(base_upper)? {
-                                    let Some(dst) = cast_reg_non_zero(add_dst)? else {
+                        if base_upper != add_dst {
+                            if let Some(base_upper) = cast_reg_non_zero(base_upper)? {
+                                let Some(dst) = cast_reg_non_zero(add_dst)? else {
                                         return Err(ProgramFromElfError::other(format!(
                                             "found an unrelocated auipc instruction in {} ('{}') at address 0x{:x}: unimplemented: destination register is zero",
                                             current_location,
@@ -3206,7 +3246,7 @@ fn parse_code_section(
                                             section.original_address() + current_location.offset,
                                         )));
                                     };
-                                    let Ok(offset) = offset.try_into() else {
+                                let Ok(offset) = offset.try_into() else {
                                         return Err(ProgramFromElfError::other(format!(
                                             "found an unrelocated auipc instruction in {} ('{}') at address 0x{:x}: offset doesn't fit in 32-bits",
                                             current_location,
@@ -3214,49 +3254,47 @@ fn parse_code_section(
                                             section.original_address() + current_location.offset,
                                         )));
                                     };
-                                    output.push((
-                                        source,
-                                        InstExt::Basic(BasicInst::AnyAny {
-                                            kind: if elf.is_64() { AnyAnyKind::Sub64 } else { AnyAnyKind::Sub32 },
-                                            dst: base_upper,
-                                            src1: RegImm::Reg(dst),
-                                            src2: RegImm::Imm(offset),
-                                        }),
-                                    ))
-                                }
+                                output.push((
+                                    source,
+                                    InstExt::Basic(BasicInst::AnyAny {
+                                        kind: if elf.is_64() { AnyAnyKind::Sub64 } else { AnyAnyKind::Sub32 },
+                                        dst: base_upper,
+                                        src1: RegImm::Reg(dst),
+                                        src2: RegImm::Imm(offset),
+                                    }),
+                                ))
                             }
-
-                            relative_offset += next_inst_size as usize;
-                            continue;
                         }
+
+                        *relative_offset += next_inst_size as usize;
+                        return Ok(());
                     }
                 }
             }
+        }
 
-            if matches!(opt_level, OptLevel::Oexperimental) {
-                if try_parse_prologue(decoder_config, elf, original_inst, &mut relative_offset, source, text, output)? {
-                    continue;
-                }
-
-                if try_parse_epilogue(decoder_config, elf, original_inst, &mut relative_offset, source, text, output)? {
-                    continue;
-                }
+        if matches!(opt_level, OptLevel::Oexperimental) {
+            if try_parse_prologue(decoder_config, elf, original_inst, relative_offset, source, text, output)? {
+                return Ok(());
             }
 
-            let original_length = output.len();
-            convert_instruction(elf, section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
-                output.push((source, inst));
-            })?;
-
-            // We need to always emit at least one instruction (even if it's a NOP) to handle potential jumps.
-            assert_ne!(
-                output.len(),
-                original_length,
-                "internal error: no instructions were emitted for instruction {original_inst:?} in section {section_name}"
-            );
+            if try_parse_epilogue(decoder_config, elf, original_inst, relative_offset, source, text, output)? {
+                return Ok(());
+            }
         }
-    }
 
+        let original_length = output.len();
+        convert_instruction(elf, section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
+            output.push((source, inst));
+        })?;
+
+        // We need to always emit at least one instruction (even if it's a NOP) to handle potential jumps.
+        assert_ne!(
+            output.len(),
+            original_length,
+            "internal error: no instructions were emitted for instruction {original_inst:?} in section {section_name}"
+        );
+    }
     Ok(())
 }
 
@@ -10177,6 +10215,7 @@ fn program_from_elf_internal(config: Config, isa: TargetInstructionSet, mut elf:
     let mut instruction_overrides = HashMap::new();
     for &section_index in &sections_code {
         let section = elf.section_by_index(section_index);
+        // TODO debug to see if one of those can identify the damn data sections.
         harvest_code_relocations(&elf, section, &decoder_config, &mut instruction_overrides, &mut relocations)?;
     }
 
