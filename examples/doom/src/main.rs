@@ -5,7 +5,9 @@ use polkavm::ProgramBlob;
 use sdl2::event::Event;
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
+use std::io::{Read, Write};
 use std::rc::Rc;
+use std::str::FromStr;
 
 mod keys;
 mod vm;
@@ -15,12 +17,21 @@ fn main() {
 
     let mut program_override = None;
     let mut rom_override = None;
+    let mut rec_file: Option<std::fs::File> = None;
     for arg in std::env::args().skip(1) {
-        let bytes = std::fs::read(arg).unwrap();
-        if bytes.starts_with(b"PVM\0") {
-            program_override = Some(bytes);
+        if arg.starts_with("--REC=") {
+            let path_str = &arg[6..];
+            let path_buf = std::path::PathBuf::from_str(&path_str).unwrap();
+            println!("Recording in {}", path_buf.to_str().unwrap());
+            let file = std::fs::File::create(&path_buf).unwrap();
+            rec_file = Some(file);
         } else {
-            rom_override = Some(bytes);
+            let bytes = std::fs::read(arg).unwrap();
+            if bytes.starts_with(b"PVM\0") {
+                program_override = Some(bytes);
+            } else {
+                rom_override = Some(bytes);
+            }
         }
     }
 
@@ -69,6 +80,15 @@ fn main() {
     vm.set_on_audio_frame(move |buffer| {
         let _ = queue.queue_audio(buffer);
     });
+
+    let mut tick_nb: u64 = 0;
+
+    if let Some(rec) = rec_file.as_mut() {
+        // always start with tick (we peak on this then process).
+        rec.write_all(&tick_nb.to_le_bytes()).unwrap();
+        rec.write_all(&RecordAction::Start.with_data(0).to_le_bytes()).unwrap();
+        rec.flush().unwrap();
+    }
 
     let mut keys: [isize; 256] = [0; 256];
     loop {
@@ -126,6 +146,17 @@ fn main() {
                     let after = keys[key as usize] > 0;
                     if before != after {
                         vm.on_keychange(key, after).unwrap();
+                        if let Some(rec) = rec_file.as_mut() {
+                            rec.write_all(&tick_nb.to_le_bytes()).unwrap();
+                            if after {
+                                rec.write_all(&RecordAction::KeyPressed.with_data(key as u64).to_le_bytes())
+                                    .unwrap();
+                            } else {
+                                rec.write_all(&RecordAction::KeyReleased.with_data(key as u64).to_le_bytes())
+                                    .unwrap();
+                            }
+                            rec.flush().unwrap();
+                        }
                     }
                 }
             }
@@ -143,6 +174,7 @@ fn main() {
         let Ok((width, height, frame)) = vm.run_for_a_frame() else {
             break;
         };
+        tick_nb = tick_nb.wrapping_add(1);
 
         canvas.clear();
         if !frame.is_empty() {
@@ -178,5 +210,53 @@ fn main() {
         }
 
         canvas.present();
+    }
+
+    if let Some(rec) = rec_file.as_mut() {
+        rec.flush().unwrap();
+    }
+}
+
+#[derive(Debug)]
+pub enum RecordAction {
+    Start = 0,
+    // not sure of any use? (can add manually and split precessing by ticks?, then start at split
+    // ticks for next sending. -> can make sense if sending every n seconds/ticks as workitem (need
+    // modify this client to send/cast in addition to write to file (can then record payload).
+    // TODO is it easy to suspend sdl too: likely yes (would need proper sound suspend though).
+    Suspend = 1,
+    KeyPressed = 2,
+    KeyReleased = 3,
+}
+impl RecordAction {
+    pub fn with_data(self, data: u64) -> u64 {
+        if data & !(u64::MAX >> 2) != 0 {
+            return RecordAction::Suspend.with_data(0);
+        }
+        data | ((self as u64) << 62)
+    }
+    pub fn read_data(data: u64) -> (RecordAction, u64) {
+        match data >> 62 {
+            val if val == RecordAction::Start as u64 => (RecordAction::Start, 0),
+            val if val == RecordAction::Suspend as u64 => (RecordAction::Suspend, 0),
+            val if val == RecordAction::KeyPressed as u64 => (RecordAction::KeyPressed, data & (u64::MAX >> 2)),
+            val if val == RecordAction::KeyReleased as u64 => (RecordAction::KeyReleased, data & (u64::MAX >> 2)),
+            _ => (RecordAction::Suspend, 0),
+        }
+    }
+}
+
+#[test]
+fn dummy_test_just_disp() {
+    let path_buf = std::path::PathBuf::from_str(&"./log_rec").unwrap();
+    let mut file = std::fs::File::open(&path_buf).unwrap();
+    let mut buf = [0u8; 8];
+    loop {
+        file.read_exact(&mut buf).unwrap();
+        let tick = u64::from_le_bytes(buf);
+        file.read_exact(&mut buf).unwrap();
+        let data = u64::from_le_bytes(buf);
+        let (action, key) = RecordAction::read_data(data);
+        println!("{}: {:?} {}", tick, action, key);
     }
 }
