@@ -5,7 +5,7 @@ use polkavm::ProgramBlob;
 use sdl2::event::Event;
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -81,12 +81,11 @@ fn main() {
         let _ = queue.queue_audio(buffer);
     });
 
-    let mut tick_nb: u64 = 0;
+    let mut tick_nb: u32 = 0;
 
     if let Some(rec) = rec_file.as_mut() {
         // always start with tick (we peak on this then process).
-        rec.write_all(&tick_nb.to_le_bytes()).unwrap();
-        rec.write_all(&RecordAction::Start.with_data(0).to_le_bytes()).unwrap();
+        rec.write_all(&RecordAction::Start.with_data(tick_nb, 0).to_le_bytes()).unwrap();
         rec.flush().unwrap();
     }
 
@@ -147,12 +146,11 @@ fn main() {
                     if before != after {
                         vm.on_keychange(key, after).unwrap();
                         if let Some(rec) = rec_file.as_mut() {
-                            rec.write_all(&tick_nb.to_le_bytes()).unwrap();
                             if after {
-                                rec.write_all(&RecordAction::KeyPressed.with_data(key as u64).to_le_bytes())
+                                rec.write_all(&RecordAction::KeyPressed.with_data(tick_nb, key as u32).to_le_bytes())
                                     .unwrap();
                             } else {
-                                rec.write_all(&RecordAction::KeyReleased.with_data(key as u64).to_le_bytes())
+                                rec.write_all(&RecordAction::KeyReleased.with_data(tick_nb, key as u32).to_le_bytes())
                                     .unwrap();
                             }
                             rec.flush().unwrap();
@@ -228,35 +226,44 @@ pub enum RecordAction {
     KeyPressed = 2,
     KeyReleased = 3,
 }
+
+type TickCount = u32;
+
 impl RecordAction {
-    pub fn with_data(self, data: u64) -> u64 {
-        if data & !(u64::MAX >> 2) != 0 {
-            return RecordAction::Suspend.with_data(0);
+    pub fn with_data(self, tick: TickCount, data: u32) -> u64 {
+        if (data as u32) & !(u32::MAX >> 2) != 0 {
+            // data type to large (content over record encoding)
+            // `with_data` should only be call on record, panicking
+            // in record due to a bug is fine.
+            panic!("data record too large");
         }
-        data | ((self as u64) << 62)
+        ((tick as u64) << 32) | ((self as u64) << 30) | (data as u64)
     }
-    pub fn read_data(data: u64) -> (RecordAction, u64) {
-        match data >> 62 {
-            val if val == RecordAction::Start as u64 => (RecordAction::Start, 0),
-            val if val == RecordAction::Suspend as u64 => (RecordAction::Suspend, 0),
-            val if val == RecordAction::KeyPressed as u64 => (RecordAction::KeyPressed, data & (u64::MAX >> 2)),
-            val if val == RecordAction::KeyReleased as u64 => (RecordAction::KeyReleased, data & (u64::MAX >> 2)),
-            _ => (RecordAction::Suspend, 0),
+    pub fn read_data(data: u64) -> (TickCount, RecordAction, u32) {
+        let tick = (data >> 32) as u32;
+        let data = data as u32;
+        match data >> 30 {
+            val if val == RecordAction::Start as u32 => (tick, RecordAction::Start, 0),
+            val if val == RecordAction::Suspend as u32 => (tick, RecordAction::Suspend, 0),
+            val if val == RecordAction::KeyPressed as u32 => (tick, RecordAction::KeyPressed, data & (u32::MAX >> 2)),
+            val if val == RecordAction::KeyReleased as u32 => (tick, RecordAction::KeyReleased, data & (u32::MAX >> 2)),
+            // Start at tick 0 is safe error place holder (as it warrants a reset of running
+            // process).
+            _ => (0, RecordAction::Start, 0),
         }
     }
 }
 
 #[test]
 fn dummy_test_just_disp() {
+    use std::io::Read;
     let path_buf = std::path::PathBuf::from_str(&"./log_rec").unwrap();
     let mut file = std::fs::File::open(&path_buf).unwrap();
     let mut buf = [0u8; 8];
     loop {
         file.read_exact(&mut buf).unwrap();
-        let tick = u64::from_le_bytes(buf);
-        file.read_exact(&mut buf).unwrap();
         let data = u64::from_le_bytes(buf);
-        let (action, key) = RecordAction::read_data(data);
+        let (tick, action, key) = RecordAction::read_data(data);
         println!("{}: {:?} {}", tick, action, key);
     }
 }
